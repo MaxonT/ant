@@ -220,6 +220,8 @@ The root package stays neutral. PostgreSQL-only conditions and types live in `di
 
 A relation with `b.ManyToMany` goes through a join table with no model. `Include` reads the join table, then the targets. In a loaded relation, removing an element deletes the join row, never the target, unlike a one-to-many relation. For extra columns on the join table, model it, with two one-to-many relations.
 
+Join rows are added with `ON CONFLICT DO NOTHING`, so a pair already there is skipped. SQL Server has no such clause, so there they go in through a `MERGE ... WITH (HOLDLOCK)` that inserts the pairs it does not find, as SQL Server's upsert does (#89). `Toggle` deletes with `RETURNING` to learn which pairs were there; MySQL has no `DELETE ... RETURNING`, so there it reads them with `FOR UPDATE` first, which a second `Toggle` waits on, and deletes what it read. Removing an element from a loaded relation slice writes nothing to the target: when the slice moved another target into its memory, the join row's removal had also sent an `UPDATE` of the removed target with its own values, which MySQL and MariaDB count as no row changed and ant took for a conflict.
+
 ## 45. Errors are classified, not wrapped
 
 Roadmap v0.4 planned sentinels such as `ErrUniqueViolation`, which would need every error path to wrap driver errors, including those that only appear while reading rows. Instead `ant.IsUniqueViolation(err)` and its siblings read the SQLSTATE from the error chain, so nothing can be missed, and the driver's own error stays intact.
@@ -232,7 +234,7 @@ Values stay out of logs unless `ant.LogValues()` is used.
 
 ## 47. Hooks run inside the write
 
-Hooks are methods on the model, found once per type, so models with none pay nothing. They run inside the unit's transaction, so an error from an After hook undoes the write, and a unit with After hooks always uses a transaction. Bulk `Update`, `Delete`, `InsertMany`, and `Raw` do not run them, because they do not load entities.
+Hooks are methods on the model, found once per type, so models with none pay nothing. They run inside the unit's transaction, so an error from an After hook undoes the write, and a unit with After hooks always uses a transaction. Bulk `Update`, `Delete`, `InsertMany`, `UpdateMany`, `Merge`, and `Raw` do not run them, because they do not load entities. `Upsert` writes one entity, so it checks the rules and runs `Validate`, `BeforeInsert`, and `AfterInsert`, whichever way the database goes, as GORM runs its create hooks on an upsert: which branch was taken is not known on every database before the write, and guessing it afterwards (`xmax = 0` on PostgreSQL, the row count on MySQL) would run update hooks on some databases and not others. A rolled back `Upsert` takes back its generated key and stamps and stops tracking the entity, as a rolled back `Insert` does.
 
 `Observer`s run after the commit, and never hear about a rollback.
 
@@ -430,6 +432,10 @@ An upsert that updated copied every column from the row it tried to insert, the 
 Now each of them moves the stored version on by one when it updates a row, as `SaveChanges` and bulk `Update` do, and a row `Merge` inserts starts at 1 unless the source gives a version. The version is ant's to keep, so naming it in `DoUpdate`, `Set`, or a `Merge` assignment is an error before anything runs.
 
 An entity passed to `Upsert` with a version of its own is a loaded copy, so its update applies only while the stored row still has that version, and otherwise `Upsert` returns a `ConcurrencyError`, as `SaveChanges` would. A zero version is a new entity, with nothing to check. `ON DUPLICATE KEY UPDATE` takes no condition, so on MySQL and MariaDB the version moves on but the copy's update goes ahead. `InsertMany` cannot tell a row's own version from the 1 it stamps on a new one, so it moves versions on without checking them.
+
+A soft delete and `Restore` are updates too. They left the version and `UpdatedAt` as they were, so a copy loaded before a soft delete saved into the deleted row with no conflict, where a real delete gives `ErrConcurrency` (#87). Both now move the version on and stamp `UpdatedAt`, tracked (`Remove`) or in bulk (`Delete`, `DeleteByID`, `Restore`). Adding `deleted_at IS NULL` to tracked updates was rejected: it would close the soft delete but not `Restore`, and a copy loaded with `WithDeleted` may mean to edit a deleted row.
+
+An untracked row the application puts into a loaded relation, loaded with `NoTracking` or decoded from JSON, was moved with an `UPDATE` of its foreign key alone, checking and moving no version (#88). Its update now checks the version the copy carries and moves it on, as `Upsert` does with a copy, and stamps `UpdatedAt`. A copy with a zero version, built from a key alone, has nothing to check, so the database moves the stored version on (`version = version + 1`) and the copy is left as it was.
 
 ## 81. A set operation's members keep their own paging
 

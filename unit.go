@@ -147,23 +147,54 @@ func (c pivotChange) run(ctx context.Context, u *unit, to exec.Executor) error {
 		return ErrNoKey
 	}
 
-	_, err := u.s.runOn(ctx, to, pivotInsert(p, local, []any{foreign}))
+	_, err := u.s.runOn(ctx, to, pivotInsert(u.s.dialect, p, local, []any{foreign}))
 
 	return err
 }
 
-func pivotInsert(p *meta.Pivot, local any, foreign []any) *qb.Insert {
-	stmt := &qb.Insert{
-		Table:    p.Table,
-		Columns:  []string{p.Local, p.Foreign},
-		Conflict: &qb.Conflict{},
-	}
+// pivotInsert adds join rows, skipping those already there: with ON CONFLICT DO
+// NOTHING, or, on a database with no such clause, a MERGE that inserts only
+// the pairs it does not find. A key given twice is added once.
+func pivotInsert(d dialect.Dialect, p *meta.Pivot, local any, foreign []any) qb.Statement {
+	seen := make(map[any]struct{}, len(foreign))
+	rows := make([][]qb.Expr, 0, len(foreign))
 
 	for _, key := range foreign {
-		stmt.Rows = append(stmt.Rows, []qb.Expr{qb.Param{Value: local}, qb.Param{Value: key}})
+		if _, twice := seen[key]; twice {
+			continue
+		}
+
+		seen[key] = struct{}{}
+		rows = append(rows, []qb.Expr{qb.Param{Value: local}, qb.Param{Value: key}})
 	}
 
-	return stmt
+	columns := []string{p.Local, p.Foreign}
+
+	if dialect.Supports(d, dialect.OnConflict) {
+		return &qb.Insert{
+			Table:    p.Table,
+			Columns:  columns,
+			Rows:     rows,
+			Conflict: &qb.Conflict{},
+		}
+	}
+
+	const source = "ant_pairs"
+
+	on := make([]qb.Cond, len(columns))
+	values := make([]qb.Expr, len(columns))
+
+	for i, c := range columns {
+		values[i] = qb.Column{Alias: source, Name: c}
+		on[i] = qb.Compare{Left: qb.Column{Table: p.Table, Name: c}, Op: qb.OpEq, Right: values[i]}
+	}
+
+	return &qb.Merge{
+		Table:   p.Table,
+		Using:   qb.Source{Values: &qb.Values{Columns: columns, Rows: rows}, Alias: source},
+		On:      on,
+		Actions: []qb.MergeAction{{Columns: columns, Values: values}},
+	}
 }
 
 func pivotDelete(p *meta.Pivot, local any, foreign []any) *qb.Delete {
@@ -491,6 +522,9 @@ func (u *unit) vacate(entry *track.Entry) {
 		entity:  copied,
 		entry:   entry,
 		scratch: true,
+		// Nothing to write: the entry's memory holds another row, which its
+		// diff would take for this row's edits.
+		changed: []*meta.Field{},
 	}
 	u.nodes[copied] = n
 	u.order = append(u.order, n)
@@ -1566,7 +1600,7 @@ func (u *unit) update(ctx context.Context, to exec.Executor, n *node) error {
 	}
 
 	if updated := n.model.Updated; updated != nil && !slices.Contains(n.changed, updated) {
-		if entity := n.entity; n.owns() {
+		if entity := n.entity; n.writesInto() {
 			n.restore = append(n.restore, prior{updated, copyOf(updated, entity)})
 			setTime(updated, entity, u.s.settings.timestamp())
 
@@ -1586,6 +1620,15 @@ func (u *unit) update(ctx context.Context, to exec.Executor, n *node) error {
 		)
 	}
 
+	// An untracked copy with no version does not know the stored one, so the
+	// database moves it on, and holders of a loaded copy still see a conflict.
+	if v := n.model.Version; v != nil && n.entry == nil && !slices.Contains(n.changed, v) {
+		stmt.Set = append(stmt.Set, qb.Assignment{
+			Column: v.Column,
+			Value:  qb.Binary{Left: qb.Column{Name: v.Column}, Op: "+", Right: qb.Param{Value: 1}},
+		})
+	}
+
 	if err := u.writeOne(ctx, to, n, stmt); err != nil {
 		return err
 	}
@@ -1599,10 +1642,44 @@ func (u *unit) update(ctx context.Context, to exec.Executor, n *node) error {
 // private copy of its row.
 func (n *node) owns() bool { return n.entry != nil && (n.entity == n.entry.Entity || n.scratch) }
 
+// writesInto reports whether an update may stamp n's entity: one it owns, or an
+// untracked one the application put into a loaded relation, which is written as
+// the application gave it.
+func (n *node) writesInto() bool { return n.owns() || n.entry == nil }
+
+// untrackedVersion returns the version an untracked entity carries, if any. A
+// zero version is one built from a key alone, with nothing to check.
+func (n *node) untrackedVersion() (reflect.Value, bool) {
+	v := n.model.Version
+	if v == nil || n.entry != nil || v.Value(n.entity).IsZero() {
+		return reflect.Value{}, false
+	}
+
+	return v.Value(n.entity), true
+}
+
 // tokenConditions requires the row to still hold the values this entity loaded.
 // The version is the one an earlier write of this unit gave the row, if any, as
 // when another instance of the row was saved first.
 func (u *unit) tokenConditions(n *node) []qb.Cond {
+	// An untracked copy is checked against the version it carries, as Upsert
+	// checks one.
+	if version, ok := n.untrackedVersion(); ok {
+		value := version.Interface()
+
+		if written, ok := u.versions[n.row()]; ok {
+			value = written.Interface()
+		}
+
+		return []qb.Cond{
+			qb.Compare{
+				Left:  n.model.ColumnOf(n.model.Version),
+				Op:    qb.OpEq,
+				Right: qb.Param{Value: value},
+			},
+		}
+	}
+
 	if n.entry == nil || !n.entry.HasOriginal() {
 		return nil
 	}
@@ -1636,7 +1713,7 @@ func (u *unit) tokenConditions(n *node) []qb.Cond {
 // as when two instances of one row are both saved.
 func (u *unit) bumpVersion(n *node) {
 	v := n.model.Version
-	if v == nil || !n.owns() {
+	if _, untracked := n.untrackedVersion(); v == nil || !n.owns() && !untracked {
 		return
 	}
 
@@ -1671,7 +1748,8 @@ func (n *node) row() rowID {
 // wroteVersion records the version n's row holds after n's write, for another
 // instance of the row written later in the unit.
 func (u *unit) wroteVersion(n *node) {
-	if v := n.model.Version; v != nil && n.owns() {
+	v := n.model.Version
+	if _, untracked := n.untrackedVersion(); v != nil && (n.owns() || untracked) {
 		if u.versions == nil {
 			u.versions = map[rowID]reflect.Value{}
 		}
@@ -1693,14 +1771,19 @@ func (u *unit) delete(ctx context.Context, to exec.Executor, n *node) error {
 	where = append(where, u.tokenConditions(n)...)
 
 	if soft := n.model.SoftDelete; soft != nil {
-		deleted := meta.DeletedAt{
-			Null: sql.Null[time.Time]{V: u.s.settings.timestamp(), Valid: true},
-		}
+		now := u.s.settings.timestamp()
+		deleted := meta.DeletedAt{Null: sql.Null[time.Time]{V: now, Valid: true}}
 
+		// A soft delete is an update: it moves the version on, so a stale copy
+		// cannot save into the deleted row.
 		return u.writeOne(ctx, to, n, &qb.Update{
 			Table: n.model.Table,
 			Where: where,
-			Set:   []qb.Assignment{{Column: soft.Column, Value: qb.Param{Value: deleted}}},
+			Set: stamps(
+				n.model,
+				[]qb.Assignment{{Column: soft.Column, Value: qb.Param{Value: deleted}}},
+				now,
+			),
 		})
 	}
 

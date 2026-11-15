@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -298,6 +299,41 @@ func TestConformanceUpsert(t *testing.T) {
 		)
 		require.NoError(t, err)
 		require.EqualValues(t, 1, n)
+	})
+}
+
+// A rolled back Upsert takes back what it filled in, as a rolled back Insert
+// does: the generated key and the timestamps, and the entity is no longer
+// tracked, so the next save inserts it.
+func TestConformanceUpsertRollback(t *testing.T) {
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		if !has(target, dialect.OnConflict) {
+			t.Skip("no upsert on " + target.Name)
+		}
+
+		app := openApp(t, target)
+		ctx := t.Context()
+		stop := errors.New("stop")
+		u := &User{Name: "a", Email: "a@x", Age: 1}
+
+		err := app.Tx(ctx, func(tx *AppDB) error {
+			if _, err := tx.Users.Upsert(ctx, u, ant.OnConflict(&Users.Email)); err != nil {
+				return err
+			}
+
+			return stop
+		})
+		require.ErrorIs(t, err, stop)
+		require.Zero(t, u.ID, "the rolled back key was taken back")
+		require.True(t, u.CreatedAt.IsZero(), "the rolled back stamp was taken back")
+
+		entry, err := ant.Entry(ctx, app, u)
+		require.NoError(t, err)
+		require.Equal(t, ant.Detached, entry.State())
+
+		require.NoError(t, ant.Add(ctx, app, u))
+		require.NoError(t, app.SaveChanges(ctx))
+		require.Equal(t, 1, countRows(t, target.DB, "users"))
 	})
 }
 
@@ -1976,34 +2012,122 @@ type EmpDB struct {
 	Emps ant.Table[Emp]
 }
 
+// openEmps makes conf_emps and opens EmpDB on it, with a clock that reads now.
+func openEmps(t *testing.T, target testdb.Target, now *time.Time) *EmpDB {
+	t.Helper()
+
+	ctx := t.Context()
+	_, err := target.DB.ExecContext(ctx, fmt.Sprintf(
+		`CREATE TABLE conf_emps (
+		id BIGINT PRIMARY KEY,
+		name VARCHAR(20) NOT NULL,
+		version BIGINT NOT NULL,
+		updated_at %[1]s NOT NULL,
+		deleted_at %[1]s NULL)`,
+		timestamps[target.Name],
+	))
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		_, _ = target.DB.ExecContext(context.Background(), "DROP TABLE conf_emps")
+	})
+
+	db, err := ant.Open[EmpDB](ctx, target.Dialect, target.DSN, ant.WithNow(func() time.Time {
+		return *now
+	}))
+	require.NoError(t, err)
+	t.Cleanup(func() { db.Close() })
+
+	return db
+}
+
+// A soft delete and a restore are updates: they move the version on and stamp
+// UpdatedAt, tracked or in bulk, so a copy loaded before either cannot save
+// into the row.
+func TestConformanceSoftDeleteMovesVersion(t *testing.T) {
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		ctx := t.Context()
+		now := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
+		db := openEmps(t, target, &now)
+
+		require.NoError(t, db.Emps.InsertOnly(ctx, &Emp{ID: 1, Name: "a"}, &Emp{ID: 2, Name: "b"}))
+
+		stored := func(id int64) *Emp {
+			e, err := db.Emps.NoTracking().WithDeleted().Where(ant.Eq(&Emps.ID, id)).First(ctx)
+			require.NoError(t, err)
+
+			return e
+		}
+
+		var conflict *ant.ConcurrencyError
+
+		steps := []struct {
+			name  string
+			id    int64
+			write func() error
+		}{
+			{"tracked Remove", 1, func() error {
+				one := ant.Session(db)
+
+				e, err := one.Emps.Find(ctx, int64(1))
+				if err != nil {
+					return err
+				}
+
+				if err := ant.Remove(ctx, one, e); err != nil {
+					return err
+				}
+
+				return one.SaveChanges(ctx)
+			}},
+			{"Restore", 1, func() error {
+				_, err := db.Emps.Where(ant.Eq(&Emps.ID, int64(1))).Restore(ctx)
+
+				return err
+			}},
+			{"bulk Delete", 2, func() error {
+				_, err := db.Emps.Where(ant.Eq(&Emps.ID, int64(2))).Delete(ctx)
+
+				return err
+			}},
+			{"DeleteByID", 1, func() error { return db.Emps.DeleteByID(ctx, int64(1)) }},
+		}
+
+		for _, step := range steps {
+			stale := ant.Session(db)
+			copyOf, err := stale.Emps.WithDeleted().Where(ant.Eq(&Emps.ID, step.id)).First(ctx)
+			require.NoError(t, err)
+
+			before := stored(step.id).Version
+			now = now.Add(time.Hour)
+
+			require.NoError(t, step.write(), step.name)
+
+			after := stored(step.id)
+			require.Equal(t, before+1, after.Version, "%s moves the version on", step.name)
+			require.Equal(t, now, after.UpdatedAt.UTC(), "%s stamps UpdatedAt", step.name)
+
+			copyOf.Name = "stale"
+
+			require.ErrorAs(
+				t,
+				stale.SaveChanges(ctx),
+				&conflict,
+				"%s: a stale copy saved",
+				step.name,
+			)
+		}
+	})
+}
+
 // UpdateMany keeps what a bulk Update keeps: it moves the version on, so a copy
 // loaded before cannot save over it, stamps UpdatedAt, and leaves soft-deleted
 // rows alone.
 func TestConformanceUpdateManyKeepsUp(t *testing.T) {
 	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
 		ctx := t.Context()
-		ts := timestamps[target.Name]
-		_, err := target.DB.ExecContext(ctx, fmt.Sprintf(
-			`CREATE TABLE conf_emps (
-			id BIGINT PRIMARY KEY,
-			name VARCHAR(20) NOT NULL,
-			version BIGINT NOT NULL,
-			updated_at %[1]s NOT NULL,
-			deleted_at %[1]s NULL)`,
-			ts,
-		))
-		require.NoError(t, err)
-
-		t.Cleanup(func() {
-			_, _ = target.DB.ExecContext(context.Background(), "DROP TABLE conf_emps")
-		})
-
 		now := time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
-		db, err := ant.Open[EmpDB](ctx, target.Dialect, target.DSN, ant.WithNow(func() time.Time {
-			return now
-		}))
-		require.NoError(t, err)
-		t.Cleanup(func() { db.Close() })
+		db := openEmps(t, target, &now)
 
 		require.NoError(t, db.Emps.InsertOnly(
 			ctx,
@@ -2012,7 +2136,7 @@ func TestConformanceUpdateManyKeepsUp(t *testing.T) {
 			&Emp{ID: 3, Name: "gone"},
 		))
 
-		_, err = db.Emps.Where(ant.Eq(&Emps.ID, int64(3))).Delete(ctx)
+		_, err := db.Emps.Where(ant.Eq(&Emps.ID, int64(3))).Delete(ctx)
 		require.NoError(t, err)
 
 		stale, err := db.Emps.Where(ant.Eq(&Emps.ID, int64(1))).First(ctx)
@@ -2148,5 +2272,115 @@ func TestConformanceJoinUsingFilters(t *testing.T) {
 			All(ctx)
 		require.NoError(t, err)
 		require.Equal(t, []string{"gone", "kept"}, got, "a probe of J, without filters")
+	})
+}
+
+// Shelf and Genre are many-to-many through conf_shelf_genres.
+type Shelf struct {
+	ID     int64
+	Name   string
+	Genres []Genre
+}
+
+func (Shelf) Configure(b *ant.ModelBuilder[Shelf]) {
+	b.Table("conf_shelves")
+	b.ManyToMany(&Shelves.Genres).Through("conf_shelf_genres").PivotColumns("shelf_id", "genre_id")
+}
+
+type Genre struct {
+	ID   int64
+	Name string
+}
+
+func (Genre) Configure(b *ant.ModelBuilder[Genre]) { b.Table("conf_genres") }
+
+var Shelves = ant.Fields[Shelf]()
+
+type ShelfDB struct {
+	ant.Context
+	Shelves ant.Table[Shelf]
+	Genres  ant.Table[Genre]
+}
+
+// Every many-to-many write works on every database: the join rows a save adds,
+// Link, Unlink, Toggle, and SyncLinks.
+func TestConformanceManyToMany(t *testing.T) {
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		ctx := t.Context()
+
+		for _, ddl := range []string{
+			`CREATE TABLE conf_shelves (id BIGINT PRIMARY KEY, name VARCHAR(20) NOT NULL)`,
+			`CREATE TABLE conf_genres (id BIGINT PRIMARY KEY, name VARCHAR(20) NOT NULL)`,
+			`CREATE TABLE conf_shelf_genres (shelf_id BIGINT NOT NULL, genre_id BIGINT NOT NULL,
+				PRIMARY KEY (shelf_id, genre_id))`,
+		} {
+			_, err := target.DB.ExecContext(ctx, ddl)
+			require.NoError(t, err)
+		}
+
+		t.Cleanup(func() {
+			for _, table := range []string{"conf_shelf_genres", "conf_genres", "conf_shelves"} {
+				_, _ = target.DB.ExecContext(context.Background(), "DROP TABLE "+table)
+			}
+		})
+
+		db, err := ant.Open[ShelfDB](ctx, target.Dialect, target.DSN)
+		require.NoError(t, err)
+		t.Cleanup(func() { db.Close() })
+
+		g := []*Genre{{ID: 1, Name: "a"}, {ID: 2, Name: "b"}, {ID: 3, Name: "c"}}
+		require.NoError(t, db.Genres.Insert(ctx, g...))
+
+		linked := func() []int64 {
+			rows, err := target.DB.QueryContext(
+				ctx,
+				"SELECT genre_id FROM conf_shelf_genres WHERE shelf_id = 1 ORDER BY genre_id",
+			)
+			require.NoError(t, err)
+
+			defer rows.Close()
+
+			var out []int64
+
+			for rows.Next() {
+				var id int64
+				require.NoError(t, rows.Scan(&id))
+
+				out = append(out, id)
+			}
+
+			require.NoError(t, rows.Err())
+
+			return out
+		}
+
+		shelf := &Shelf{ID: 1, Name: "s", Genres: []Genre{*g[0], *g[1]}}
+		require.NoError(t, db.Shelves.Insert(ctx, shelf), "Insert adds the join rows")
+		require.Equal(t, []int64{1, 2}, linked())
+
+		require.NoError(t, ant.Link(ctx, db, shelf, &Shelves.Genres, g[2], g[0], g[2]))
+		require.Equal(t, []int64{1, 2, 3}, linked(), "Link skips pairs already there")
+
+		require.NoError(t, ant.Unlink(ctx, db, shelf, &Shelves.Genres, g[1]))
+		require.Equal(t, []int64{1, 3}, linked())
+
+		require.NoError(t, ant.Toggle(ctx, db, shelf, &Shelves.Genres, g[0], g[1]))
+		require.Equal(t, []int64{2, 3}, linked(), "Toggle removes 1 and adds 2")
+
+		require.NoError(t, ant.SyncLinks(ctx, db, shelf, &Shelves.Genres, g[0], g[2]))
+		require.Equal(t, []int64{1, 3}, linked())
+
+		loaded, err := db.Shelves.Include(&Shelves.Genres).Find(ctx, int64(1))
+		require.NoError(t, err)
+
+		loaded.Genres = append(loaded.Genres, *g[1])
+
+		require.NoError(t, db.SaveChanges(ctx), "a save adds a join row")
+		require.Equal(t, []int64{1, 2, 3}, linked())
+
+		loaded.Genres = slices.DeleteFunc(loaded.Genres, func(x Genre) bool { return x.ID == 1 })
+
+		require.NoError(t, db.SaveChanges(ctx), "a save removes one")
+		require.Equal(t, []int64{2, 3}, linked())
 	})
 }
