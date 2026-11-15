@@ -2,14 +2,19 @@ package tests
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/skudra-go/ant"
+	"github.com/skudra-go/ant/dialect"
 	"github.com/skudra-go/ant/internal/testdb"
 )
 
@@ -216,5 +221,187 @@ func TestTxNestedBegin(t *testing.T) {
 		require.NoError(t, inner.Commit())
 		require.NoError(t, outer.Commit())
 		require.Equal(t, 3, countRows(t, target.DB, "users"))
+	})
+}
+
+// With WithoutAutoTx, the rows a failed save wrote before the failure stay, and
+// the tracker records them, so a retry writes only the rest.
+func TestWithoutAutoTxRetrySavesTheRest(t *testing.T) {
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		ctx := t.Context()
+
+		app, err := ant.Open[AppDB](ctx, target.Dialect, target.DSN, ant.WithoutAutoTx())
+		require.NoError(t, err)
+		t.Cleanup(func() { app.Close() })
+
+		taken := &User{Name: "taken", Email: "taken@x"}
+		require.NoError(t, app.Users.Insert(ctx, taken))
+
+		first := &User{Name: "first", Email: "first@x"}
+		clash := &User{Name: "clash", Email: "taken@x"}
+
+		require.NoError(t, ant.Add(ctx, app, first))
+		require.NoError(t, ant.Add(ctx, app, clash))
+
+		require.Error(t, app.SaveChanges(ctx))
+		require.Equal(t, 2, countRows(t, target.DB, "users"), "the first insert stays")
+		require.NotZero(t, first.ID, "and keeps its key")
+
+		entry, err := ant.Entry(ctx, app, first)
+		require.NoError(t, err)
+		require.Equal(t, ant.Unchanged, entry.State(), "the tracker knows it was saved")
+
+		clash.Email = "clash@x"
+
+		require.NoError(t, app.SaveChanges(ctx))
+		require.Equal(t, 3, countRows(t, target.DB, "users"), "the retry inserts only the rest")
+	})
+}
+
+// endsTx ends the transaction on the server, as a deadlock does on MySQL and SQL
+// Server, just before the INSERT that writes match, and fails that INSERT.
+type endsTx struct {
+	match string
+	tx    atomic.Pointer[sql.Tx]
+}
+
+var errDeadlock = errors.New("deadlock")
+
+func (e *endsTx) Before(ctx context.Context, s *ant.Statement) (context.Context, error) {
+	tx := e.tx.Load()
+	if tx == nil || !strings.HasPrefix(s.SQL, "INSERT") || !slices.Contains(s.Args, any(e.match)) {
+		return ctx, nil
+	}
+
+	e.tx.Store(nil)
+
+	if _, err := tx.ExecContext(ctx, "ROLLBACK"); err != nil {
+		return ctx, err
+	}
+
+	return ctx, errDeadlock
+}
+
+func (*endsTx) After(context.Context, *ant.Statement, ant.Outcome) {}
+
+// When the database ends the whole transaction under a save's savepoint, as a
+// deadlock does on MySQL and SQL Server, the transaction is over: ant refuses
+// to run anything more in it, rather than running it outside any transaction,
+// and the saves made in it before are undone in the tracker.
+func TestSavepointLostEndsTx(t *testing.T) {
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		ctx := t.Context()
+		ends := &endsTx{match: "Second"}
+
+		app, err := ant.Open[AppDB](ctx, target.Dialect, target.DSN, ant.WithInterceptor(ends))
+		require.NoError(t, err)
+		t.Cleanup(func() { app.Close() })
+
+		first := &User{Name: "First", Email: "first@x"}
+		second := &User{Name: "Second", Email: "second@x"}
+
+		var retried error
+
+		err = app.Tx(ctx, func(tx *AppDB) error {
+			if err := tx.Users.Insert(ctx, first); err != nil {
+				return err
+			}
+
+			ends.tx.Store(ant.CurrentTx(tx))
+
+			require.NoError(t, ant.Add(ctx, tx, second))
+			require.ErrorIs(t, tx.SaveChanges(ctx), errDeadlock)
+
+			// The caller retries, as decision 31 allows, and moves on.
+			retried = tx.SaveChanges(ctx)
+
+			return nil
+		})
+
+		require.ErrorIs(t, retried, ant.ErrTxDone, "the retry ran outside the transaction")
+		require.ErrorIs(t, err, ant.ErrTxDone, "the lost transaction committed")
+		require.Zero(t, countRows(t, target.DB, "users"))
+		require.Zero(t, first.ID, "the lost insert keeps no key")
+	})
+}
+
+// A deadlock that ends the whole transaction, as on MySQL and SQL Server, ends
+// it for ant too, even with no savepoint: what the caller runs next in it is
+// refused rather than run outside any transaction.
+func TestDeadlockEndsTx(t *testing.T) {
+	testdb.ForEach(t, func(t *testing.T, target testdb.Target) {
+		if !dialect.SyntaxOf(target.Dialect).RetryEndsTx {
+			t.Skip("a deadlock ends only the statement on " + target.Name)
+		}
+
+		ctx := t.Context()
+		app := openApp(t, target)
+		users := seedUsers(t, app, "one", 1, "two", 2)
+
+		update := fmt.Sprintf(
+			"UPDATE users SET age = age + 1 WHERE id = %s",
+			target.Dialect.Placeholder(1),
+		)
+
+		// The other transaction writes more, so the database picks this one as
+		// the victim: MySQL undoes the smaller one, and SQL Server the one with
+		// the lower priority.
+		other, err := target.DB.BeginTx(ctx, nil)
+		require.NoError(t, err)
+
+		defer func() { _ = other.Rollback() }()
+
+		if target.Name == "sqlserver" {
+			_, err = other.ExecContext(ctx, "SET DEADLOCK_PRIORITY HIGH")
+			require.NoError(t, err)
+		}
+
+		insert := fmt.Sprintf(
+			"INSERT INTO posts (user_id, title, published, created_at, updated_at) VALUES (%s, %s, %s, %s, %s)",
+			target.Dialect.Placeholder(1),
+			target.Dialect.Placeholder(2),
+			target.Dialect.Placeholder(3),
+			target.Dialect.Placeholder(4),
+			target.Dialect.Placeholder(5),
+		)
+
+		for range 20 {
+			now := time.Now().UTC()
+			_, err = other.ExecContext(ctx, insert, users[1].ID, "p", false, now, now)
+			require.NoError(t, err)
+		}
+
+		var next error
+
+		err = app.Tx(ctx, func(tx *AppDB) error {
+			if _, err := ant.Raw[struct{}](tx, update, users[0].ID).Exec(ctx); err != nil {
+				return err
+			}
+
+			_, err := other.ExecContext(ctx, update, users[1].ID)
+			require.NoError(t, err)
+
+			done := make(chan error, 1)
+
+			go func() {
+				_, err := other.ExecContext(ctx, update, users[0].ID)
+				done <- err
+			}()
+
+			// Waits for the other transaction's lock, which waits for this one's.
+			_, deadlock := ant.Raw[struct{}](tx, update, users[1].ID).Exec(ctx)
+			require.True(t, ant.IsRetryable(deadlock), "want a deadlock, got %v", deadlock)
+			require.NoError(t, <-done)
+			require.NoError(t, other.Commit())
+
+			// The caller ignores it and goes on.
+			next = tx.Users.Insert(ctx, &User{Name: "after", Email: "after@x"})
+
+			return nil
+		})
+
+		require.ErrorIs(t, next, ant.ErrTxDone, "a statement ran outside the transaction")
+		require.ErrorIs(t, err, ant.ErrTxDone)
+		require.Equal(t, 2, countRows(t, target.DB, "users"))
 	})
 }

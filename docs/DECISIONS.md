@@ -162,6 +162,10 @@ Appending to a relation slice can move its elements, and `slices.Delete` shifts 
 
 `SaveChanges` runs in one transaction, or a savepoint inside one, even for a single statement, as EF Core does, since PostgreSQL aborts the whole transaction when one statement fails. On failure nothing is saved, generated keys are cleared, and pending changes remain, so the call can be repeated. A rollback of an enclosing transaction also reverses what the tracker recorded as saved, which EF Core does not do. An entity whose row vanished is `ErrConcurrency`, and a changed primary key is `ErrKeyChanged`, rather than a write to the wrong row.
 
+With `WithoutAutoTx` and no transaction open, each statement stands once it runs, so a failure partway leaves the earlier rows written. Those keep their generated keys and stamps, and the tracker records them as saved and tells observers, so a retry, by hand or by `WithRetry`, writes only the rest; clearing them, as a rolled back save does, made the retry insert them again (#71). Refusing the retry instead was rejected: the rows are there, and the tracker should say so.
+
+A failed save leaves the transaction usable only where the database rolls back just the failed statement. On MySQL, MariaDB, and SQL Server a deadlock, and on MariaDB a serialization failure, rolls back the whole transaction, so the savepoint is gone and every later statement on the connection ran outside any transaction, while the tracker took the earlier saves as done (#90). Now, when such an error ends a statement on those databases (`dialect.Syntax.RetryEndsTx`), or returning to one of ant's savepoints fails, ant marks the transaction lost: its tracker changes are undone, its observers never run, every later statement returns `ErrTxDone`, and `Tx` and `Commit` roll it back and return that error. `WithRetry` then runs the whole transaction again, as it should.
+
 ## 32. Navigation and foreign key changes
 
 A relation that still holds what was loaded does not touch the foreign key, so `post.UserID = 5` works with `post.User` loaded. A row removed from one loaded relation and added to another is moved, not deleted, whether the other relation was loaded or not, and whether its parent is new in the same save or not. A row in a new position only updates its foreign key. A pointer to a parent that held one when last loaded or saved, and is empty now, unlinks; one that was empty leaves the foreign key to the application.
@@ -356,7 +360,7 @@ A `.Sensitive()` field's value is wrapped in `qb.Secret` as it enters the statem
 
 ## 71. Dependencies stay out of the root package
 
-The root package uses the standard library. Code that needs more goes elsewhere: `pgxext` for pgx, and separate modules for OpenTelemetry (`contrib/otel`), the analyzer (`tools/antvet`), and the benchmarks (`tools/compare`). `Batch` left the root package for this reason, as the roadmap's `ant.Batch` needed pgx. `dialect/mysql` imports its driver, as the error numbers are not reachable any other way, and only a program using MySQL compiles it.
+The root package uses the standard library. Code that needs more goes elsewhere: `pgxext` for pgx, and separate modules for OpenTelemetry (`contrib/otel`), the analyzer (`tools/antvet`), and the benchmarks (`tools/compare`). `Batch` left the root package for this reason, as the roadmap's `ant.Batch` needed pgx. `pgxext` reaches pgx through a pool connection of its own, as `database/sql` gives no access to a transaction's connection, so `Copy` and `Batch.Send` refuse a context bound to a transaction with `ErrInTx`: they wrote on another connection, committed on their own, and survived the caller's rollback, and `anttest.Isolate`'s with them (#104). `dialect/mysql` imports its driver, as the error numbers are not reachable any other way, and only a program using MySQL compiles it.
 
 ## 72. Partitions are not migrations
 
