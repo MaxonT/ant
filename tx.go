@@ -34,9 +34,13 @@ type txState struct {
 	// ctx is the context the transaction began with, and stop stops the
 	// rollback that waits for it to end. taken is the connection ant took for
 	// the transaction, given back when it ends.
-	ctx   context.Context
-	stop  func() bool
-	taken *sql.Conn
+	ctx  context.Context
+	stop func() bool
+	// stopped closes once the rollback for an ended context has given the
+	// connection back. waited means ended has dealt with that rollback.
+	stopped chan struct{}
+	waited  bool
+	taken   *sql.Conn
 }
 
 // sees reports whether ant will learn how the changes made in t now end: in a
@@ -120,7 +124,9 @@ func settle(ctx context.Context, steps []undoStep, run func(track.Change)) {
 
 // txOptions holds what TxOption configures.
 type txOptions struct {
-	sql      sql.TxOptions
+	sql sql.TxOptions
+	// attempts is zero until Attempts sets it, which leaves the context's retry
+	// policy in force.
 	attempts int
 }
 
@@ -128,7 +134,7 @@ type txOptions struct {
 type TxOption func(*txOptions)
 
 func resolveTx(options []TxOption) txOptions {
-	o := txOptions{attempts: 1}
+	var o txOptions
 
 	for _, option := range options {
 		option(&o)
@@ -207,8 +213,11 @@ func (s *state) begin(ctx context.Context, o txOptions) (*txState, error) {
 	}
 
 	t.tx = tx
+	t.stopped = make(chan struct{})
 
 	t.stop = context.AfterFunc(ctx, func() {
+		defer close(t.stopped)
+
 		_ = tx.Rollback()
 
 		t.giveBack()
@@ -231,13 +240,20 @@ func (t *txState) commit() error {
 }
 
 // ended stops the rollback that waits for the context the transaction began
-// with, and reports whether that context has ended.
+// with, and reports whether that context has ended. If that rollback has begun,
+// it waits for it, so the connection is back in the pool when Tx returns.
 func (t *txState) ended() bool {
 	if t.stop == nil {
 		return false
 	}
 
-	t.stop()
+	if !t.waited {
+		t.waited = true
+
+		if !t.stop() {
+			<-t.stopped
+		}
+	}
 
 	return t.ctx.Err() != nil
 }
@@ -492,8 +508,10 @@ func (t *txState) abort(ctx context.Context) {
 // to run again, so it should not change anything outside the database. Before a
 // retry, the tracker forgets what the failed attempt loaded or added, so the next
 // attempt reads its rows afresh; what was tracked before the transaction stays,
-// with any change made to it, so f should load what it changes.
-func Attempts(n int) TxOption { return func(o *txOptions) { o.attempts = n } }
+// with any change made to it, so f should load what it changes. For this call
+// it replaces the policy of WithRetry, which the other options leave in force,
+// and f runs once for an n below 2.
+func Attempts(n int) TxOption { return func(o *txOptions) { o.attempts = max(n, 1) } }
 
 // Tx runs f in a transaction, passing a context of the same type bound to it.
 // The transaction commits if f returns nil, and rolls back if it returns an
@@ -522,8 +540,8 @@ func (c *Context) Tx[DB any](ctx context.Context, f func(tx *DB) error, options 
 
 	o := resolveTx(options)
 
-	if len(options) == 0 && s.settings.retry.Attempts > 1 {
-		o.attempts = s.settings.retry.Attempts
+	if o.attempts == 0 {
+		o.attempts = max(s.settings.retry.Attempts, 1)
 	}
 
 	for attempt := 1; ; attempt++ {
