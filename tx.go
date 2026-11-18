@@ -305,6 +305,35 @@ func (s *state) transact(ctx context.Context, several bool, write func(exec.Exec
 	return t.commit()
 }
 
+// nestedTx runs f in a savepoint, honouring the options it was given. A
+// savepoint cannot carry options of its own: read-only is the one PostgreSQL
+// allows to change inside a transaction, until the savepoint ends, and an
+// isolation level cannot change there at all. Dropping either silently would
+// remove a guard exactly when the caller believed it was adding one, so a
+// database that cannot change read-only there returns ErrUnsupported.
+func (s *state) nestedTx[DB any](ctx context.Context, f func(tx *DB) error, o txOptions) error {
+	if o.sql.Isolation != 0 {
+		return ErrNestedIsolation
+	}
+
+	if o.sql.ReadOnly && !dialect.Supports(s.dialect, dialect.ReadOnlyInTx) {
+		return fmt.Errorf("%w: %s on %s", ErrUnsupported, dialect.ReadOnlyInTx, s.dialect.Name())
+	}
+
+	if !o.sql.ReadOnly {
+		return s.savepoint(ctx, func() error { return f(s.self.(*DB)) })
+	}
+
+	return s.savepoint(ctx, func() error {
+		if _, err := s.exec.ExecContext(ctx, "SET TRANSACTION READ ONLY"); err != nil {
+			return err
+		}
+
+		return f(s.self.(*DB))
+	})
+}
+
+// savepoint runs body in a savepoint ant opens in the transaction s is in.
 func (s *state) savepoint(ctx context.Context, body func() error) error {
 	sp, err := s.openSavepoint(ctx)
 	if err != nil {
@@ -516,7 +545,9 @@ func Attempts(n int) TxOption { return func(o *txOptions) { o.attempts = max(n, 
 // Tx runs f in a transaction, passing a context of the same type bound to it.
 // The transaction commits if f returns nil, and rolls back if it returns an
 // error or panics. Inside a transaction, Tx uses a savepoint instead, so only
-// the inner part rolls back. The context shares this one's tracker, and a
+// the inner part rolls back. There ReadOnly holds until the savepoint ends, and
+// returns ErrUnsupported on a database that cannot change it once a
+// transaction has begun; Isolation returns ErrNestedIsolation. The context shares this one's tracker, and a
 // rollback restores the tracker's view of what was saved, and takes back the
 // keys, timestamps, and versions the saves wrote into tracked entities, so the
 // next SaveChanges writes them again.
@@ -535,7 +566,7 @@ func (c *Context) Tx[DB any](ctx context.Context, f func(tx *DB) error, options 
 	}
 
 	if s.tx != nil {
-		return s.savepoint(ctx, func() error { return f(s.self.(*DB)) })
+		return s.nestedTx(ctx, f, resolveTx(options))
 	}
 
 	o := resolveTx(options)

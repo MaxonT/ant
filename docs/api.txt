@@ -585,6 +585,7 @@ ant: var ErrIncludeInSubquery
 ant: var ErrKeyChanged
 ant: var ErrKeyType
 ant: var ErrMultipleRows
+ant: var ErrNestedIsolation
 ant: var ErrNilEntity
 ant: var ErrNoAssignment
 ant: var ErrNoColumnType
@@ -633,6 +634,7 @@ dialect: const FullJoin
 dialect: const LateralJoin
 dialect: const Merge
 dialect: const OnConflict
+dialect: const ReadOnlyInTx
 dialect: const ReturningDelete
 dialect: const ReturningInsert
 dialect: const ReturningUpdate
