@@ -10,12 +10,23 @@ import (
 	"github.com/skudra-go/ant/tests/features/fixture"
 )
 
+// namedNames is a slice of a named string type, which the driver cannot encode
+// as an array on its own.
+type namedNames []string
+
+// namedStatuses stands in for a slice of an enum element type.
+type namedStatuses []CampaignStatus
+
+// CampaignStatus is the named element type from the report.
+type CampaignStatus string
+
 // Raw SQL can use ? instead of $1, and a slice fills an IN list.
 func TestRawArguments(t *testing.T) {
 	fixture.Run(t, func(t *testing.T, db *fixture.AppDB) {
 		fixture.Seed(t, db)
 		ctx := t.Context()
 		ages := []int{17, 30}
+		namedNames := namedNames{"Alice", "Bob"}
 
 		t.Run("? is a placeholder", func(t *testing.T) {
 			got, err := ant.Raw[string](
@@ -86,6 +97,47 @@ func TestRawArguments(t *testing.T) {
 			).All(ctx)
 			require.NoError(t, err)
 			require.Equal(t, []string{"Alice", "Bob"}, got)
+		})
+
+		t.Run("a slice of a named type is one array value", func(t *testing.T) {
+			got, err := ant.Raw[string](
+				db,
+				`SELECT name FROM users WHERE name = ANY(?) ORDER BY name`,
+				namedNames,
+			).All(ctx)
+			require.NoError(t, err)
+			require.Equal(t, []string{"Alice", "Bob"}, got)
+		})
+
+		t.Run("a slice of a named type bound to an enum array", func(t *testing.T) {
+			for _, ddl := range []string{
+				`CREATE TYPE campaign_status AS ENUM ('draft', 'live')`,
+				`CREATE TEMP TABLE campaigns (status campaign_status NOT NULL)`,
+				`INSERT INTO campaigns (status) VALUES ('draft')`,
+			} {
+				_, err := ant.Raw[any](db, ddl).Exec(ctx)
+				require.NoError(t, err)
+			}
+
+			for _, arg := range []any{
+				namedStatuses{CampaignStatus("draft")},
+				[]CampaignStatus{"draft"},
+			} {
+				for _, query := range []string{
+					`SELECT count(*) FROM campaigns WHERE status = ANY(?)`,
+					`SELECT count(*) FROM campaigns WHERE status = ANY($1)`,
+				} {
+					got, err := ant.Raw[int64](db, query, arg).First(ctx)
+					require.NoError(t, err, "%s with %T", query, arg)
+					require.Equal(t, int64(1), *got)
+				}
+			}
+
+			found, err := db.Users.Where(
+				ant.SQLCond(`name = ANY(?)`, namedNames),
+			).Count(ctx)
+			require.NoError(t, err, "a condition binds it as one array too")
+			require.Equal(t, int64(2), found)
 		})
 
 		t.Run("the jsonb ? operator still works", func(t *testing.T) {
