@@ -120,6 +120,10 @@ func (t *tool) diff(ctx context.Context, name string, renames []string, empty, d
 		return err
 	}
 
+	if err := t.inStep(ctx, c); err != nil {
+		return err
+	}
+
 	if empty {
 		return t.writeEmpty(ctx, store, c, name, dry)
 	}
@@ -345,10 +349,11 @@ func (t *tool) adopt(ctx context.Context, file, name string) error {
 		return err
 	}
 
+	body, roles := withoutRoles(t.d, withoutMetaCommands(string(data)))
 	text := fmt.Sprintf(
 		"-- The schema as it was when this project adopted ant, from %s.\n\n%s",
 		schema.Comment(filepath.Base(file)),
-		withoutMetaCommands(string(data)),
+		body,
 	)
 
 	m, err := t.compose(c, name, text)
@@ -378,11 +383,69 @@ func (t *tool) adopt(ctx context.Context, file, name string) error {
 
 	t.say("Wrote %s, and the snapshot from your models.", t.location(m))
 
+	if roles > 0 {
+		t.say(
+			"Left out %d statements that give tables to roles or grant to them (OWNER TO, GRANT, REVOKE): "+
+				"a database owned by another role could not run them. Grants the application needs "+
+				"belong in a migration of their own. A dump made with pg_dump --no-owner --no-privileges "+
+				"has none.",
+			roles,
+		)
+	}
+
 	t.say(
-		"New databases run that file. On each database that already has this schema, run: baseline",
+		"New databases run that file. On each database that already has this schema, run: baseline %s",
+		m.Version,
 	)
 
 	return nil
+}
+
+// withoutRoles removes the statements of a dump that name roles: ownership and
+// privileges. They hold the roles of the database dumped, so the baseline failed
+// on any database owned by another, as in CI or on a managed service (#191).
+// pg_dump writes each on a line of its own. Only a line that is a whole
+// statement of the script goes, so one inside a function's body stays. It
+// returns how many it removed.
+func withoutRoles(d schema.Dialect, text string) (string, int) {
+	names := func(statement string) bool {
+		upper := strings.ToUpper(statement)
+
+		return strings.HasPrefix(upper, "ALTER ") && strings.Contains(upper, " OWNER TO ") ||
+			strings.HasPrefix(upper, "GRANT ") ||
+			strings.HasPrefix(upper, "REVOKE ") ||
+			strings.HasPrefix(upper, "ALTER DEFAULT PRIVILEGES ")
+	}
+
+	roles := map[string]bool{}
+
+	for _, statement := range d.Split(text) {
+		// Split keeps the comments before a statement with it.
+		lines := strings.Split(statement, "\n")
+		last := strings.TrimSpace(lines[len(lines)-1])
+
+		if names(last) {
+			roles[last] = true
+		}
+	}
+
+	var (
+		b       strings.Builder
+		removed int
+	)
+
+	for line := range strings.Lines(text) {
+		statement, whole := strings.CutSuffix(strings.TrimSpace(line), ";")
+		if whole && roles[statement] {
+			removed++
+
+			continue
+		}
+
+		b.WriteString(line)
+	}
+
+	return b.String(), removed
 }
 
 // withoutMetaCommands removes psql commands, such as the \\restrict lines recent
@@ -399,6 +462,38 @@ func withoutMetaCommands(text string) string {
 	return b.String()
 }
 
+// inStep fails if the snapshot was not written for the newest migration file,
+// so a diff from it would be measured from the wrong place. A snapshot written
+// for a file that is gone is one whose change no file holds any more: diff
+// found no changes, as the snapshot had them, and running snapshot then made
+// check pass with the change in no migration at all (#179).
+func (t *tool) inStep(ctx context.Context, c *catalog) error {
+	old, err := t.snapshot(ctx)
+	if err != nil || old == nil || old.Latest == "" {
+		return err
+	}
+
+	if !slices.ContainsFunc(c.versioned, func(m Migration) bool { return m.ID() == old.Latest }) {
+		return fmt.Errorf(
+			"%w: it was written for %s, which has no file. If you deleted that file to write "+
+				"it again, put back the snapshot it replaced, from git, then run diff",
+			ErrStaleSnapshot,
+			old.Latest,
+		)
+	}
+
+	if last := c.lastFile(); last != nil && old.Latest != last.ID() {
+		return fmt.Errorf(
+			"%w: it was written for %s, and the newest file is %s. After a merge, renumber if needed, then run snapshot",
+			ErrStaleSnapshot,
+			old.Latest,
+			last.ID(),
+		)
+	}
+
+	return nil
+}
+
 // check fails if the migration files and models are not in step. It needs no
 // database, so it suits CI.
 func (t *tool) check(ctx context.Context) error {
@@ -407,19 +502,8 @@ func (t *tool) check(ctx context.Context) error {
 		return err
 	}
 
-	old, err := t.snapshot(ctx)
-	if err != nil {
+	if err := t.inStep(ctx, c); err != nil {
 		return err
-	}
-
-	if last := c.lastFile(); last != nil && old != nil && old.Latest != "" &&
-		old.Latest != last.ID() {
-		return fmt.Errorf(
-			"%w: it was written for %s, and the newest file is %s. After a merge, renumber if needed, then run snapshot",
-			ErrStaleSnapshot,
-			old.Latest,
-			last.ID(),
-		)
 	}
 
 	plan, _, err := t.plan(ctx, nil)

@@ -107,3 +107,94 @@ ALTER TABLE accounts ALTER COLUMN age DROP DEFAULT;`,
 		require.Contains(t, must[V2DB](p, "drift"), "No drift")
 	})
 }
+
+// Two branches both write 0002, and one database already ran the other
+// branch's. Once one file is renumbered, that database's 0002 is a different
+// migration from the file, not an edit to it: read as one, repair recorded the
+// file as applied though it never ran there (#178).
+func TestRenumberedMigration(t *testing.T) {
+	each(t, func(t *testing.T, p *project) {
+		p.write("versions/0001_init.up.sql", "CREATE TABLE items (id int);")
+		p.write("versions/0002_add_bee.up.sql", "ALTER TABLE items ADD COLUMN bee int;")
+		must[V1DB](p, "up")
+
+		// After the merge, bee became 0003 and ay took 0002.
+		require.NoError(t, removeFile(p, "versions/0002_add_bee.up.sql"))
+		p.write("versions/0002_add_ay.up.sql", "ALTER TABLE items ADD COLUMN ay int;")
+		p.write("versions/0003_add_bee.up.sql", "ALTER TABLE items ADD COLUMN bee int;")
+
+		const said = "0002_add_ay was applied as 0002_add_bee, a different migration"
+
+		for _, command := range []string{"up", "repair"} {
+			_, err := run[V1DB](p, command)
+			require.ErrorIs(t, err, migrate.ErrChecksum, command)
+			require.ErrorContains(t, err, said, command)
+		}
+
+		require.Equal(t, []string{"id", "bee"}, p.columns("items"), "nothing ran or was recorded")
+
+		t.Run("an edit that keeps the name is still one repair can accept", func(t *testing.T) {
+			require.NoError(t, removeFile(p, "versions/0002_add_ay.up.sql"))
+			require.NoError(t, removeFile(p, "versions/0003_add_bee.up.sql"))
+
+			p.write(
+				"versions/0002_add_bee.up.sql",
+				"ALTER TABLE items ADD COLUMN bee int; -- edited",
+			)
+
+			_, err := run[V1DB](p, "up")
+			require.ErrorIs(t, err, migrate.ErrChecksum)
+			require.NotContains(t, err.Error(), "a different migration")
+
+			require.Contains(
+				t,
+				must[V1DB](p, "repair"),
+				"Accepted the current contents of 0002_add_bee",
+			)
+		})
+
+		t.Run("a new name with the same contents is the same migration", func(t *testing.T) {
+			require.NoError(t, removeFile(p, "versions/0002_add_bee.up.sql"))
+
+			p.write(
+				"versions/0002_add_bee_column.up.sql",
+				"ALTER TABLE items ADD COLUMN bee int; -- edited",
+			)
+
+			require.Contains(t, must[V1DB](p, "up"), "Nothing to apply")
+		})
+	})
+}
+
+// A file deleted to write it again under a better name takes its change with it,
+// while the snapshot still holds the change. diff found nothing to write, and the
+// advice to run snapshot made check pass with the change in no migration (#179).
+func TestDeletedNewestFile(t *testing.T) {
+	each(t, func(t *testing.T, p *project) {
+		must[V1DB](p, "diff", "start")
+		before := p.read("versions/schema.snapshot.json")
+		must[V2DB](p, "diff", "add_bio")
+		require.Len(t, listFiles(p, "versions"), 2)
+
+		for _, f := range listFiles(p, "versions") {
+			if f != listFiles(p, "versions")[0] {
+				require.NoError(t, removeFile(p, "versions/"+f))
+			}
+		}
+
+		for _, args := range [][]string{{"diff", "add_bio_column"}, {"diff", "by_hand", "--empty"}, {"check"}} {
+			_, err := run[V2DB](p, args...)
+			require.ErrorIs(t, err, migrate.ErrStaleSnapshot, args)
+			require.ErrorContains(t, err, "which has no file", args)
+			require.ErrorContains(t, err, "put back the snapshot it replaced", args)
+		}
+
+		require.Len(t, listFiles(p, "versions"), 1, "nothing was written")
+
+		t.Run("with the snapshot put back, diff writes the change again", func(t *testing.T) {
+			p.write("versions/schema.snapshot.json", before)
+			require.Contains(t, must[V2DB](p, "diff", "add_bio_column"), "add_bio_column")
+			require.Contains(t, must[V2DB](p, "check"), "OK")
+		})
+	})
+}

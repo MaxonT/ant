@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // Format is the version of the snapshot file format.
@@ -92,6 +93,25 @@ type Partition struct {
 	Columns []string `json:"columns"`
 }
 
+// partitioning says how a table is partitioned, as PARTITION BY does, or that
+// it is not.
+func partitioning(p *Partition) string {
+	if p == nil {
+		return "not partitioned"
+	}
+
+	return "partitioned by " + p.Method + " (" + strings.Join(p.Columns, ", ") + ")"
+}
+
+// samePartitioning reports whether a and b partition a table the same way.
+func samePartitioning(a, b *Partition) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	return strings.EqualFold(a.Method, b.Method) && slices.Equal(a.Columns, b.Columns)
+}
+
 // Ref returns the table's name.
 func (t *Table) Ref() Ref { return Ref{t.Schema, t.Name} }
 
@@ -164,11 +184,14 @@ type Index struct {
 	// Concurrent builds the index without blocking writes, on an existing table.
 	// It says how to build the index, so changing it alone is not a change.
 	Concurrent bool `json:"concurrent,omitempty"`
+	// Invalid marks an index a live database has but does not use, as a CREATE
+	// INDEX CONCURRENTLY that failed leaves behind. Only Inspect sets it.
+	Invalid bool `json:"invalid,omitempty"`
 }
 
 func (i *Index) sameAs(o *Index) bool {
 	return slices.Equal(i.Parts, o.Parts) && i.Unique == o.Unique && i.Method == o.Method &&
-		i.Where == o.Where && slices.Equal(i.Include, o.Include)
+		i.Where == o.Where && slices.Equal(i.Include, o.Include) && i.Invalid == o.Invalid
 }
 
 // ForeignKey is a foreign key constraint.

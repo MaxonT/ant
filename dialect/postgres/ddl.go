@@ -469,6 +469,16 @@ func (d impl) Statements(change schema.Change) ([]string, error) {
 
 		return out, nil
 	case schema.AddColumn:
+		if c.References != nil {
+			// Added NULL, for the rows to be filled, then made NOT NULL: see
+			// the change.
+			open := *c.Column
+			open.Nullable = true
+
+			return append(alter(c.Table, "ADD COLUMN "+d.column(&open)),
+				alter(c.Table, "ALTER COLUMN "+d.Quote(c.Column.Name)+" SET NOT NULL")...), nil
+		}
+
 		if c.Backfill == "" {
 			return alter(c.Table, "ADD COLUMN "+d.column(c.Column)), nil
 		}
@@ -515,7 +525,18 @@ func (d impl) Statements(change schema.Change) ([]string, error) {
 			fmt.Sprintf("RENAME CONSTRAINT %s TO %s", d.Quote(c.From), d.Quote(c.To)),
 		), nil
 	case schema.CreateIndex:
-		return []string{d.createIndex(c.Table, c.Index, c.RunsOnline())}, nil
+		create := d.createIndex(c.Table, c.Index, c.RunsOnline())
+
+		// A concurrent build that fails leaves an invalid index of the name, and
+		// running the file again then failed with "already exists" (#97).
+		if c.RunsOnline() {
+			return []string{
+				"DROP INDEX CONCURRENTLY IF EXISTS " + d.indexRef(c.Table, c.Index.Name),
+				create,
+			}, nil
+		}
+
+		return []string{create}, nil
 	case schema.DropIndex:
 		out := "DROP INDEX "
 
@@ -550,7 +571,7 @@ func (d impl) Statements(change schema.Change) ([]string, error) {
 		}
 
 		return []string{out}, nil
-	case schema.RemoveEnumValue, schema.ReorderEnum:
+	case schema.RemoveEnumValue, schema.ReorderEnum, schema.Repartition:
 		return nil, nil // only a warning: see the change
 	case schema.AlterSequence:
 		out := "ALTER SEQUENCE " + d.Quote(c.To.Name)

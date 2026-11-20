@@ -1,8 +1,10 @@
 package ant
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"reflect"
 	"slices"
@@ -89,18 +91,65 @@ func models(db any) ([]*meta.Model, error) {
 	return out, sameTable(out)
 }
 
-// tableModels returns the configured models of a context struct's Table
-// fields. eachTable has already accepted the struct.
-func tableModels(db any) []*meta.Model {
-	var out []*meta.Model
+// checkModels checks every model of a context struct and every model its
+// relations reach, and resolves each relation, so that a model ant can't use
+// fails when the context opens rather than on first use, as the docs promise.
+// A relation that found no foreign key, or a join table with no name, passed
+// Open and failed the first request that touched it (#203). It reports every
+// problem it finds, not only the first, so a large model set is fixed in one go.
+func checkModels(db any) error {
+	var (
+		seen     []*meta.Model
+		problems []error
+	)
 
-	_ = eachTable(db, func(table any) error {
-		out = append(out, table.(modelTable).tableModel())
+	add := func(m *meta.Model) {
+		if slices.Contains(seen, m) {
+			return
+		}
+
+		configureModel(m)
+		seen = append(seen, m)
+
+		if err := m.Err(); err != nil {
+			problems = append(problems, err)
+		}
+	}
+
+	if err := eachTable(db, func(table any) error {
+		add(table.(modelTable).tableModel())
 
 		return nil
-	})
+	}); err != nil {
+		problems = append(problems, err)
+	}
 
-	return out
+	tables := slices.Clone(seen)
+
+	for i := 0; i < len(seen); i++ {
+		if seen[i].Err() != nil {
+			continue
+		}
+
+		for _, r := range seen[i].Relations {
+			target := meta.OfType(r.Target)
+			add(target)
+
+			if target.Err() != nil {
+				continue
+			}
+
+			if _, err := linkFor(r); err != nil {
+				problems = append(problems, err)
+			}
+		}
+	}
+
+	if err := sameTable(tables); err != nil {
+		problems = append(problems, err)
+	}
+
+	return errors.Join(problems...)
 }
 
 var (
@@ -238,6 +287,10 @@ func buildSchema(d schema.Dialect, db any) (*schema.Schema, error) {
 	}
 
 	if err := b.constraints(list); err != nil {
+		return nil, err
+	}
+
+	if err := distinctNames(b.out); err != nil {
 		return nil, err
 	}
 
@@ -489,7 +542,11 @@ func (b *schemaBuilder) column(m *meta.Model, f *meta.Field) (*schema.Column, er
 	}
 
 	if q := storage.Sequence; q != nil {
-		c.Default = "nextval('" + strings.ReplaceAll(q.Name, "'", "''") + "')"
+		c.Default = "nextval('" + strings.ReplaceAll(typeName(b.d, q.Name), "'", "''") + "')"
+	}
+
+	if e := storage.Enum; e != nil && c.Type == e.Name {
+		c.Type = typeName(b.d, e.Name)
 	}
 
 	label := m.Type.Name() + "." + f.Name
@@ -515,6 +572,25 @@ func (b *schemaBuilder) column(m *meta.Model, f *meta.Field) (*schema.Column, er
 	}
 
 	return c, nil
+}
+
+// typeName writes the name of an enum or a sequence where a column uses it, as
+// CREATE TYPE and CREATE SEQUENCE named it: quoted. PostgreSQL folds a name
+// without quotes to lower case, so a column of type UserStatus looked for
+// userstatus, which did not exist (#100). A lower-case name stays as it is,
+// as the database gives it back.
+func typeName(d schema.Dialect, name string) string {
+	plain := name != ""
+
+	for i, r := range name {
+		plain = plain && (r == '_' || r >= 'a' && r <= 'z' || i > 0 && r >= '0' && r <= '9')
+	}
+
+	if plain {
+		return name
+	}
+
+	return d.Quote(name)
 }
 
 func (b *schemaBuilder) columnType(t reflect.Type, s meta.Storage) string {
@@ -759,6 +835,8 @@ func (b *schemaBuilder) foreignKeys() error {
 			)
 		}
 
+		typeAsTarget(column, key.column, key.ref, parent)
+
 		name := key.name
 		if name == "" {
 			name = schema.ForeignKeyName(b.d, t.Name, column.Name)
@@ -814,6 +892,10 @@ func (b *schemaBuilder) constraints(models []*meta.Model) error {
 			for i := range key.Columns {
 				columns[i], refs[i] = key.Columns[i].Column, key.Refs[i].Column
 				parts[i] = schema.IndexPart{Column: columns[i]}
+
+				if column := t.Column(columns[i]); column != nil {
+					typeAsTarget(column, key.Columns[i], key.Refs[i], b.owner[key.Target])
+				}
 			}
 
 			name := key.Name
@@ -841,6 +923,95 @@ func (b *schemaBuilder) constraints(models []*meta.Model) error {
 	}
 
 	return nil
+}
+
+// distinctNames refuses two tables, keys or indexes of one schema with one name,
+// which PostgreSQL keeps in one namespace. The default names join columns with
+// underscores, so an index on a_b and one on (a, b) both became t_a_b_idx, and
+// the second CREATE INDEX failed when the migration ran, after check had passed
+// (#112). Naming one with .Name(...) settles it.
+func distinctNames(s *schema.Schema) error {
+	owners := map[[2]string]string{}
+
+	claim := func(schemaName, name, what string) error {
+		at := [2]string{schemaName, name}
+		if other, ok := owners[at]; ok {
+			return fmt.Errorf(
+				"%w: %s and %s are both named %s: name one of them with .Name(...)",
+				ErrBadSchema,
+				other,
+				what,
+				name,
+			)
+		}
+
+		owners[at] = what
+
+		return nil
+	}
+
+	for _, t := range s.Tables {
+		ref := t.Ref().String()
+
+		if err := claim(t.Schema, t.Name, "table "+ref); err != nil {
+			return err
+		}
+
+		if k := t.PrimaryKey; k != nil {
+			if err := claim(t.Schema, k.Name, "the primary key of "+ref); err != nil {
+				return err
+			}
+		}
+
+		for _, k := range t.Uniques {
+			what := fmt.Sprintf("the unique key on %s (%s)", ref, strings.Join(k.Columns, ", "))
+			if err := claim(t.Schema, k.Name, what); err != nil {
+				return err
+			}
+		}
+
+		for _, i := range t.Indexes {
+			columns := make([]string, len(i.Parts))
+
+			for n, part := range i.Parts {
+				columns[n] = cmp.Or(part.Column, part.Expr)
+			}
+
+			what := fmt.Sprintf("the index on %s (%s)", ref, strings.Join(columns, ", "))
+			if err := claim(t.Schema, i.Name, what); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// typeAsTarget gives a foreign key column with no type of its own the type its
+// target was given, as a join table's columns take theirs. A string key typed
+// uuid left a string foreign key text, which PostgreSQL cannot join to uuid,
+// so the migration failed on its first run (#187). A serial target is the
+// integer it draws from a sequence, which the referring column holds.
+func typeAsTarget(column *schema.Column, field, ref *meta.Field, target *schema.Table) {
+	if target == nil || field.Storage.Type != "" || field.Storage.Enum != nil ||
+		ref.Storage.Type == "" {
+		return
+	}
+
+	to := target.Column(ref.Column)
+	if to == nil {
+		return
+	}
+
+	column.Type = to.Type
+
+	if plain, ok := map[string]string{
+		"smallserial": "smallint",
+		"serial":      "integer",
+		"bigserial":   "bigint",
+	}[strings.ToLower(to.Type)]; ok {
+		column.Type = plain
+	}
 }
 
 func isUnique(t *schema.Table, column string) bool {

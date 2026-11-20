@@ -35,6 +35,22 @@ func (e *engine) repair(ctx context.Context) error {
 			return err
 		}
 
+		entries := e.entries(c, rows)
+
+		// A file that is another migration than the one applied is no edit to
+		// accept: it never ran here.
+		var others []error
+
+		for _, entry := range entries {
+			if entry.State == Changed && entry.appliedAs != "" {
+				others = append(others, renumbered(entry))
+			}
+		}
+
+		if len(others) > 0 {
+			return errors.Join(others...)
+		}
+
 		count := 0
 
 		byKey := func(key string) *record {
@@ -47,7 +63,7 @@ func (e *engine) repair(ctx context.Context) error {
 			return nil
 		}
 
-		for _, entry := range e.entries(c, rows) {
+		for _, entry := range entries {
 			switch {
 			case entry.State == Failed:
 				e.say(
@@ -88,7 +104,8 @@ func (e *engine) repair(ctx context.Context) error {
 }
 
 // baseline records versioned migrations as applied without running them, through
-// version, or all of them. It is how an existing database joins.
+// version, or with no version the one migration not yet recorded. It is how an
+// existing database joins.
 func (e *engine) baseline(ctx context.Context, version string) error {
 	return e.locked(ctx, func(conn *sql.Conn) error {
 		// The migrations first, so that a folder that is not there records
@@ -115,7 +132,7 @@ func (e *engine) baseline(ctx context.Context, version string) error {
 			return err
 		}
 
-		count := 0
+		var unrecorded []Migration
 
 		for _, m := range c.versioned {
 			if version != "" && compareVersions(m.Version, version) > 0 {
@@ -131,6 +148,34 @@ func (e *engine) baseline(ctx context.Context, version string) error {
 				continue
 			}
 
+			unrecorded = append(unrecorded, m)
+		}
+
+		// With no version, which migrations the database has is a guess: one
+		// adopted after more were written would have them recorded without
+		// ever running them (#190). One migration to record is the baseline
+		// itself; more need the version the database has reached.
+		if version == "" && len(unrecorded) > 1 {
+			ids := make([]string, len(unrecorded))
+
+			for i, m := range unrecorded {
+				ids[i] = m.ID()
+			}
+
+			return fmt.Errorf(
+				"%w: baseline would record %s as applied without running them. Name the "+
+					"version this database has reached: baseline %s records only the first, "+
+					"baseline %s all of them",
+				ErrBadMigration,
+				strings.Join(ids, ", "),
+				unrecorded[0].Version,
+				unrecorded[len(unrecorded)-1].Version,
+			)
+		}
+
+		count := 0
+
+		for _, m := range unrecorded {
 			r := record{
 				Kind:      Versioned,
 				Key:       m.Version,

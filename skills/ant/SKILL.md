@@ -75,7 +75,9 @@ adults, err := db.Users.
 ```
 
 - `ant.Open` fills in every `ant.Table` field and fails at startup if a model can't
-  be mapped. Open once per process. Never construct `AppDB` yourself.
+  be mapped: an unknown tag key, two fields on one column, a relation with no
+  foreign key, or `[]*Post` where `[]Post` is meant. It reports every broken model
+  at once. Open once per process. Never construct `AppDB` yourself.
 - The application imports the driver: `_ "github.com/jackc/pgx/v5/stdlib"` for
   PostgreSQL, `_ "modernc.org/sqlite"`, `_ "github.com/go-sql-driver/mysql"` or
   `_ "github.com/microsoft/go-mssqldb"`.
@@ -123,7 +125,9 @@ Calls that take columns of mixed types take `ant.FieldRef`, made with
 - Tags: `ant:"-"` (not a column), `column=name`, `unique`, `default=expr` (a zero
   value means "use the database default" on insert, so `Active bool` with
   `default=true` never inserts `false`: make it `*bool` with `.NotNull()` where the
-  zero must be stored; updates, including an upsert's, write the zero), `readonly`, `writeonly`, `immutable`,
+  zero must be stored; updates, including an upsert's, write the zero), `readonly` (filled by the database:
+  a generated column or one a trigger keeps, read back after every insert and
+  update), `writeonly`, `immutable`,
   `computed` (filled by `Query.With`), `version` (optimistic concurrency, a signed
   integer field),
   `embedded` / `embedded,prefix=x_`. Combine with commas.
