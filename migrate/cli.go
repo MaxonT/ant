@@ -102,7 +102,7 @@ func Run[DB any](ctx context.Context, d dialect.Dialect, args []string, config .
 		config:     c,
 		source:     source,
 		registered: registeredMigrations[DB](),
-		models:     func() (*schema.Schema, error) { return ant.SchemaOf[DB](d) },
+		models:     func() (*schema.Schema, error) { return ant.SchemaOf[DB](d, c.Options...) },
 		ask:        terminalQuestions(os.Stdin, c.Out),
 	}
 
@@ -225,7 +225,9 @@ func Run[DB any](ctx context.Context, d dialect.Dialect, args []string, config .
 		return fmt.Errorf("%s needs a database: pass --dsn, or set DATABASE_URL", command)
 	}
 
-	db, err := ant.Open[DB](ctx, d, dsn, ant.WithTracking(false))
+	options := append(slices.Clip(c.Options), ant.WithTracking(false))
+
+	db, err := ant.Open[DB](ctx, d, dsn, options...)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
@@ -395,18 +397,16 @@ func (e *engine) preview(ctx context.Context, to string) error {
 	}
 
 	count := 0
+	versioned := false
 
 	for _, entry := range entries {
 		m := entry.migration
-		if m == nil || (entry.State != Pending && entry.State != Outdated && entry.State != Late) {
-			continue
-		}
-
-		if to != "" && (m.Kind == Repeatable || compareVersions(m.Version, to) > 0) {
+		if m == nil || !within(*m, to) || (!runs(entry) && !rerunsAfter(entry, versioned)) {
 			continue
 		}
 
 		count++
+		versioned = versioned || m.Kind == Versioned
 
 		e.say("-- %s", m.ID())
 
