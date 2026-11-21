@@ -59,10 +59,10 @@ func (q *Query[T]) within(skip, size int) (*Query[T], bool) {
 // Page returns one page, counted from 1, with the total row count. Order the
 // query, or pages may overlap. Use After for large tables, where counting and
 // skipping rows gets slow. A Limit or Offset on the query says which rows
-// there are to page through.
+// there are to page through. A number or size below 1 returns ErrPaging.
 func (q *Query[T]) Page(ctx context.Context, number, size int) (*Page[T], error) {
 	if number < 1 || size < 1 {
-		return nil, fmt.Errorf("ant: page %d of size %d", number, size)
+		return nil, fmt.Errorf("%w: page %d of size %d", ErrPaging, number, size)
 	}
 
 	total, err := q.ClearOrder().Count(ctx)
@@ -90,9 +90,16 @@ func (q *Query[T]) Page(ctx context.Context, number, size int) (*Page[T], error)
 // returns an error or the rows run out. Paging uses Offset, so order the query
 // and do not change matching rows in f. Use ChunkByKey when f changes them. A
 // Limit or Offset on the query says which rows there are to read.
+//
+// On a context that tracks, a group stays tracked while f runs. Once f returns
+// with nothing left to save, as after SaveChanges, Chunk stops tracking what
+// the group began tracking, including what f loaded or added, so one group is
+// held at a time: edit a group's entities, and save them, inside f. While
+// anything on the context is left unsaved, by f or before Chunk, the group
+// stays tracked for the save that follows.
 func (q *Query[T]) Chunk(ctx context.Context, size int, f func([]*T) error) error {
 	if size < 1 {
-		return fmt.Errorf("ant: chunk size %d", size)
+		return fmt.Errorf("%w: chunk size %d", ErrPaging, size)
 	}
 
 	for offset := 0; ; offset += size {
@@ -100,6 +107,8 @@ func (q *Query[T]) Chunk(ctx context.Context, size int, f func([]*T) error) erro
 		if !ok {
 			return nil
 		}
+
+		mark := q.state.tracker.Mark()
 
 		items, err := page.All(ctx)
 		if err != nil {
@@ -110,6 +119,8 @@ func (q *Query[T]) Chunk(ctx context.Context, size int, f func([]*T) error) erro
 			if err := f(items); err != nil {
 				return err
 			}
+
+			q.state.letGo(ctx, mark)
 		}
 
 		if len(items) < size {
@@ -123,9 +134,10 @@ func (q *Query[T]) Chunk(ctx context.Context, size int, f func([]*T) error) erro
 // place by key, so f can change or delete the rows it receives. The key is read
 // even if Column or Omit left it out. A Limit or Offset on the query counts
 // rows in key order: the offset is skipped once, and the limit ends the read.
+// Like Chunk, it stops tracking each group once f leaves nothing to save.
 func (q *Query[T]) ChunkByKey(ctx context.Context, size int, f func([]*T) error) error {
 	if size < 1 {
-		return fmt.Errorf("ant: chunk size %d", size)
+		return fmt.Errorf("%w: chunk size %d", ErrPaging, size)
 	}
 
 	model := q.model()
@@ -172,6 +184,8 @@ func (q *Query[T]) ChunkByKey(ctx context.Context, size int, f func([]*T) error)
 			return nil
 		}
 
+		mark := q.state.tracker.Mark()
+
 		items, err := page.Limit(take).All(ctx)
 		if err != nil {
 			return err
@@ -197,10 +211,41 @@ func (q *Query[T]) ChunkByKey(ctx context.Context, size int, f func([]*T) error)
 			return err
 		}
 
+		q.state.letGo(ctx, mark)
+
 		if len(items) < size {
 			return nil
 		}
 	}
+}
+
+// letGo stops tracking what a group of Chunk or ChunkByKey began tracking since
+// mark, its rows, their includes, and what its callback loaded or added, once a
+// save would write nothing, so that a walk over a large table holds one group
+// at a time (#151). A group whose callback left changes to save stays tracked,
+// for the save that follows, and so does one that an entity tracked before the
+// group holds in a loaded relation.
+func (s *state) letGo(ctx context.Context, mark uint64) {
+	end := s.tracker.Mark()
+	if end == mark {
+		return
+	}
+
+	release, err := s.hold(ctx)
+	if err != nil {
+		return
+	}
+
+	defer release()
+
+	u := newUnit(s)
+	u.dry = true
+
+	if err := u.collect(); err != nil || u.writesAnything() {
+		return
+	}
+
+	s.tracker.ForgetAlone(mark, end)
 }
 
 // CursorPage is one page from After.
@@ -266,7 +311,7 @@ func (q *Query[T]) keyset() ([]sortColumn, error) {
 // count of the rows before it, so a query with a Limit or Offset is refused.
 func (q *Query[T]) After(ctx context.Context, cursor string, size int) (*CursorPage[T], error) {
 	if size < 1 {
-		return nil, fmt.Errorf("ant: page size %d", size)
+		return nil, fmt.Errorf("%w: page size %d", ErrPaging, size)
 	}
 
 	if q.limit != nil || q.offset != nil {

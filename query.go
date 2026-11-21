@@ -118,7 +118,7 @@ func then[T any](q *Query[T], term Sort) *Query[T] {
 }
 
 // Limit caps the number of rows returned. Zero returns none, and a negative
-// n is an error at the terminal call, as it is for Offset.
+// n is ErrPaging at the terminal call, as it is for Offset.
 func (q *Query[T]) Limit(n int) *Query[T] {
 	c := q.next()
 	c.limit = c.paging("Limit", n)
@@ -793,7 +793,11 @@ func (q *Query[T]) Find[K comparable](ctx context.Context, key K) (*T, error) {
 }
 
 // Each streams matching rows, stopping after the first error. Values are
-// copies, so streamed rows are not tracked.
+// copies, so streamed rows are not tracked. In a transaction, or on a context
+// from UseConn, the rows stream on its one connection until the loop ends, and
+// a statement inside the loop on that context returns ErrQueryInEach, except on
+// SQLite, whose connection can run it. Collect what the loop needs and act
+// after it, or read the rows with All or Chunk.
 func (q *Query[T]) Each(ctx context.Context) iter.Seq2[T, error] {
 	return func(yield func(T, error) bool) {
 		var zero T
@@ -828,6 +832,11 @@ func (q *Query[T]) Each(ctx context.Context) iter.Seq2[T, error] {
 
 			return
 		}
+
+		// The connection streams until the loop ends, so in a transaction it
+		// refuses the loop's own statements meanwhile.
+		q.state.streams.start()
+		defer q.state.streams.stop()
 
 		stream(rows, yield)
 	}

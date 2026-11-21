@@ -34,8 +34,10 @@ Writing migrations (no database needed):
   schema-dump            print the whole schema as SQL
     --snapshot             use the snapshot, instead of the models
   inspect [table]        list the tables and columns the models describe
-  script                 print all migrations as one idempotent SQL file
+  script                 print all migrations as one idempotent SQL file, stopping
+                           before a Go migration, which only up can run
     --plain                no guards or history, for use with other tools
+    --from <version>       leave out the migrations before this version, as applied
 
 Running them (needs a database):
   up                     apply pending migrations, then changed repeatable ones
@@ -112,12 +114,13 @@ func Run[DB any](ctx context.Context, d dialect.Dialect, args []string, config .
 	flags := newFlags(command)
 
 	var (
-		renames              repeated
-		dsn, to, confirmName string
-		empty, dry, keep     bool
-		plain, showSQL       bool
-		fromSnapshot, seed   bool
-		checkStatus          bool
+		renames            repeated
+		dsn, to, from      string
+		confirmName        string
+		empty, dry, keep   bool
+		plain, showSQL     bool
+		fromSnapshot, seed bool
+		checkStatus        bool
 	)
 	flags.StringVar(&dsn, "dsn", "", "")
 
@@ -137,6 +140,7 @@ func Run[DB any](ctx context.Context, d dialect.Dialect, args []string, config .
 		flags.BoolVar(&keep, "keep", false, "")
 	case "script":
 		flags.BoolVar(&plain, "plain", false, "")
+		flags.StringVar(&from, "from", "", "")
 	case "schema-dump":
 		flags.BoolVar(&fromSnapshot, "snapshot", false, "")
 	case "reset":
@@ -157,6 +161,13 @@ func Run[DB any](ctx context.Context, d dialect.Dialect, args []string, config .
 
 	if len(positional) > 1 && command != "seed" {
 		return fmt.Errorf("%s takes one name, and got: %s", command, strings.Join(positional, " "))
+	}
+
+	// A folder is found from the working directory, so the commands that
+	// compare or write migrations say which they read. SQL meant for a pipe
+	// stays alone.
+	if command == "check" || command == "status" || command == "diff" && !dry {
+		fmt.Fprintln(c.Out, "Migrations:", c.describe(source))
 	}
 
 	switch command {
@@ -204,6 +215,7 @@ func Run[DB any](ctx context.Context, d dialect.Dialect, args []string, config .
 			history{ddl, c.HistorySchema, c.HistoryTable},
 			cat,
 			plain,
+			from,
 			func(warning string) { fmt.Fprintln(os.Stderr, "Warning:", warning) },
 		)
 		if err != nil {
